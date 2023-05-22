@@ -5,6 +5,7 @@ import html
 import io
 import re
 import time
+import base64
 from pypdf import PdfReader, PdfWriter
 from azure.identity import AzureDeveloperCliCredential
 from azure.core.credentials import AzureKeyCredential
@@ -13,10 +14,14 @@ from azure.search.documents.indexes import SearchIndexClient
 from azure.search.documents.indexes.models import *
 from azure.search.documents import SearchClient
 from azure.ai.formrecognizer import DocumentAnalysisClient
+import tiktoken
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 
 MAX_SECTION_LENGTH = 1000
 SENTENCE_SEARCH_LIMIT = 100
 SECTION_OVERLAP = 100
+CHUNK_SIZE = 500
+CHUNK_OVERLAP = 50
 
 parser = argparse.ArgumentParser(
     description="Prepare documents by extracting content from PDFs, splitting content into sections, uploading to blob storage, and indexing in a search index.",
@@ -53,9 +58,15 @@ if not args.localpdfparser:
         exit(1)
     formrecognizer_creds = default_creds if args.formrecognizerkey == None else AzureKeyCredential(args.formrecognizerkey)
 
+def get_extension(filename):
+    return os.path.splitext(filename)[1].lower()
+
 def blob_name_from_file_page(filename, page = 0):
-    if os.path.splitext(filename)[1].lower() == ".pdf":
+    extension = get_extension(filename)
+    if extension == ".pdf":
         return os.path.splitext(os.path.basename(filename))[0] + f"-{page}" + ".pdf"
+    elif extension == ".txt":
+        return os.path.splitext(os.path.basename(filename))[0] + f"-{page}" + ".txt"
     else:
         return os.path.basename(filename)
 
@@ -66,7 +77,8 @@ def upload_blobs(filename):
         blob_container.create_container()
 
     # if file is PDF split into pages and upload each page as a separate blob
-    if os.path.splitext(filename)[1].lower() == ".pdf":
+    extension = get_extension(filename)
+    if extension == ".pdf":
         reader = PdfReader(filename)
         pages = reader.pages
         for i in range(len(pages)):
@@ -82,6 +94,36 @@ def upload_blobs(filename):
         blob_name = blob_name_from_file_page(filename)
         with open(filename,"rb") as data:
             blob_container.upload_blob(blob_name, data, overwrite=True)
+
+def upload_blobs_for_text(filename):
+    blob_service = BlobServiceClient(account_url=f"https://{args.storageaccount}.blob.core.windows.net", credential=storage_creds)
+    blob_container = blob_service.get_container_client(args.container)
+    if not blob_container.exists():
+        blob_container.create_container()
+
+    # if file is PDF split into pages and upload each page as a separate blob
+    extension = get_extension(filename)
+    pages = []
+    if extension == ".txt":
+        with open(filename, "r", encoding="utf-8") as f:
+            data = f.read()
+            chunk = text_splitter.split_text(data)
+
+            for i, chunkedtext in enumerate(chunk):
+                blob_name = blob_name_from_file_page(filename, i)
+                if args.verbose:
+                    print(f"\tUploading blob for page {i} -> {blob_name}")
+                strIO = io.StringIO(chunkedtext)
+                bin_data_from_strIO = io.BytesIO(bytes(strIO.getvalue(), encoding="utf-8"))
+                blob_container.upload_blob(blob_name, bin_data_from_strIO, overwrite=True)
+
+                pages.append([blob_name, chunkedtext])
+    else:
+        blob_name = blob_name_from_file_page(filename)
+        with open(filename,"rb") as data:
+            blob_container.upload_blob(blob_name, data, overwrite=True)
+
+    return pages
 
 def remove_blobs(filename):
     if args.verbose: print(f"Removing blobs for '{filename or '<all>'}'")
@@ -230,6 +272,14 @@ def create_sections(filename, page_map):
             "sourcefile": filename
         }
 
+def create_sections_for_text(pages):
+    for chunk in pages:
+        yield {
+            "id": base64.urlsafe_b64encode(chunk[0].encode()),
+            "content": chunk[1],
+            "sourcepage": chunk[0]
+        }
+
 def create_search_index():
     if args.verbose: print(f"Ensuring search index {args.index} exists")
     index_client = SearchIndexClient(endpoint=f"https://{args.searchservice}.search.windows.net/",
@@ -297,6 +347,13 @@ if args.removeall:
 else:
     if not args.remove:
         create_search_index()
+
+    enc = tiktoken.get_encoding("gpt2")
+    text_splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
+        encoding_name="gpt2",
+        chunk_size=CHUNK_SIZE, 
+        chunk_overlap=CHUNK_OVERLAP
+    )
     
     print(f"Processing files...")
     for filename in glob.glob(args.files):
@@ -308,8 +365,14 @@ else:
             remove_blobs(None)
             remove_from_index(None)
         else:
-            if not args.skipblobs:
-                upload_blobs(filename)
-            page_map = get_document_text(filename)
-            sections = create_sections(os.path.basename(filename), page_map)
-            index_sections(os.path.basename(filename), sections)
+            extension = get_extension(filename)
+            if extension == ".pdf":
+                if not args.skipblobs:
+                    upload_blobs(filename)
+                page_map = get_document_text(filename)
+                sections = create_sections(os.path.basename(filename), page_map)
+                index_sections(os.path.basename(filename), sections)
+            elif extension == ".txt":
+                pages = upload_blobs_for_text(filename)
+                sections = create_sections_for_text(pages)
+                index_sections(os.path.basename(filename), sections)
