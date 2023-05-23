@@ -20,6 +20,12 @@ Sources:
 {chat_history}
 """
 
+    prompt_prefix_no_citation = """<|im_start|>system
+日本の歴史に関する質問をサポートする教師アシスタントです。回答は簡潔にしてください。
+<|im_end|>
+{chat_history}
+"""
+
     follow_up_questions_prompt_content = """日本の歴史について、ユーザーが次に尋ねそうな非常に簡潔なフォローアップ質問を3つ作成する。
     質問を参照するには、二重の角括弧を使用します（例：<<徳川家康とは何をした人ですか?>>）。
     すでに聞かれた質問を繰り返さないようにしましょう。
@@ -91,6 +97,7 @@ Search query:
             prompt = self.prompt_prefix.format(injected_prompt=prompt_override[3:] + "\n", sources=content, chat_history=self.get_chat_history_as_text(history), follow_up_questions_prompt=follow_up_questions_prompt)
         else:
             prompt = prompt_override.format(sources=content, chat_history=self.get_chat_history_as_text(history), follow_up_questions_prompt=follow_up_questions_prompt)
+        prompt_no_citation = self.prompt_prefix_no_citation.format(chat_history=self.get_chat_history_as_text(history))
 
         # STEP 3: Generate a contextual and content specific answer using the search results and chat history
         completion = openai.Completion.create(
@@ -102,6 +109,18 @@ Search query:
             stop=["<|im_end|>", "<|im_start|>"])
 
         answer = completion.choices[0].text.replace("[info1.txt]", "").replace("[info2.txt]", "")
+
+        if answer in ["わからない", "わからない。", "分からない", "分からない。"]:
+            completion = openai.Completion.create(
+                engine=self.chatgpt_deployment, 
+                prompt=prompt_no_citation, 
+                temperature=overrides.get("temperature") or 0.7, 
+                max_tokens=1024, 
+                n=1, 
+                stop=["<|im_end|>", "<|im_start|>"])
+
+            answer = "この回答はChatGPTが生成しています。内容に誤りが含まれている可能性があります。<br><br>"
+            answer += completion.choices[0].text.replace("[info1.txt]", "").replace("[info2.txt]", "")
 
         return {"data_points": results, "answer": answer, "thoughts": f"Searched for:<br>{q}<br><br>Prompt:<br>" + prompt.replace('\n', '<br>')}
     
